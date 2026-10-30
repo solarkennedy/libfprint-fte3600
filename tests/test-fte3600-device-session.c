@@ -11,12 +11,16 @@ struct event { int kind;uint32_t status,value;size_t length;const uint8_t *tx,*r
 struct fixture { const char *name;const struct event *events;size_t count;enum fte3600_factory_model model;uint16_t chip,raw,width,height,extra;
     const uint8_t *pram;size_t pram_length;const uint8_t *app;size_t app_length;const uint8_t *firmware;size_t firmware_length;const struct event *negative;size_t negative_count,unconfirmed_stop; };
 #include "device_session_fixtures.h"
+/* FT9769 raw-array flow: every arm resets the part and captures a DAC-centering
+ * frame plus a no-finger reference frame; the finger frame follows on IRQ. */
+static int raw_array(const struct fixture *f) { return f->model==FTE3600_MODEL_FT9769; }
+static inline unsigned per_request(const struct fixture *f) { return raw_array(f)?3:1; }
 struct bus {
     const struct fixture *fixture;size_t next;
     uint16_t words[32768];uint8_t bytes[256],mode;
     uint64_t clock,calls;unsigned frames,measurements,version_reads,uploads;
     size_t frame_position;unsigned pattern;
-    int fail_fifo,wait_failure,latched,frame_absent,unhealthy;
+    int fail_fifo,wait_failure,latched,frame_absent,unhealthy,finger,irq_finger;
     uint32_t recovery_failure;
     unsigned recovery_gpio_calls,recovery_sync_calls;
     int fail_recovery_gpio;
@@ -38,6 +42,9 @@ static void record_write(struct bus *b,const uint8_t *tx,size_t n)
     if (n==3) {
         if (tx[0]==0x5a || tx[0]==0xc0) b->mode=0x50;
         if (tx[0]==0xc4 || tx[0]==0xc8) { b->mode=0x54;b->frame_position=0; }
+        /* Finger-detect armed: a finger lands at once, unless the runtime test
+         * delivers it with its fake interrupt instead (irq_finger). */
+        if (tx[0]==0xc2 && !b->irq_finger) b->finger=1;
     }
 }
 static uint16_t sample(struct bus *b,size_t i)
@@ -91,10 +98,10 @@ static uint32_t spi(void *context,uint8_t *tx,size_t n)
     }
     if (tx[0]==6 && n>=8 && tx[1]==0xf9) {
         size_t count=(n-8)/2;
-        for (size_t i=0;i<count;++i) {uint16_t v=sample(b,b->frame_position+i);tx[6+2*i]=(uint8_t)(v>>8);tx[7+2*i]=(uint8_t)v;}
+        for (size_t i=0;i<count;++i) {uint16_t v=sample(b,b->frame_position+i);if (b->finger) v-=(uint16_t)(300+(b->frame_position+i)*7%60+b->pattern*20);tx[6+2*i]=(uint8_t)(v>>8);tx[7+2*i]=(uint8_t)v;}
         tx[n-2]=tx[n-1]=0;b->frame_position+=count;
         size_t samples=(size_t)b->fixture->width*(b->fixture->height+b->fixture->extra);
-        if (b->frame_position==samples) ++b->frames;
+        if (b->frame_position==samples) {++b->frames;b->finger=0;}
         return 0;
     }
     if (n>=4 && (tx[0]==0xff || tx[0]==0x91 || tx[0]==0x90)) {
@@ -123,7 +130,12 @@ static uint32_t spi(void *context,uint8_t *tx,size_t n)
     if (n==5 && tx[0]==8 && tx[1]==0xf7) {tx[4]=tx[2]==0x80?b->mode:b->bytes[tx[2]];return 0;}
     if (n>=10 && tx[0]==4 && tx[1]==0xfb) {
         size_t at=((size_t)(tx[2]&127)<<8)|tx[3];
-        uint16_t v=at==0x1a82?0x28:b->words[at];
+        /* Identification after the transcript: silicon id, and the 0x1816 window
+         * marker that remaps 0x9391 to 0x9395 for the remap fixture. */
+        /* 0x1a82 bit 3 is the latched finger-detect event: raw-array fixtures
+         * only report it while the synthetic finger is present. */
+        uint16_t v=at==0x1a82?((b->finger||!raw_array(b->fixture))?0x28:0x20):at==0x1a8b?b->fixture->raw:
+                   (at==0x1816 && b->fixture->chip==0x9395 && b->fixture->raw==0x9391)?0x0fff:b->words[at];
         memset(tx+6,0,n-6);tx[6]=(uint8_t)(v>>8);tx[7]=(uint8_t)v;
         if (n==14 || n==16) ++b->measurements;
         return 0;
@@ -211,8 +223,13 @@ static void scenario(const struct fixture *f)
     CHECK(fte3600_device_copy_image(s,2,untouched,sizeof(untouched))==FTE3600_DEVICE_NO_FRAME);CHECK(untouched[0]==0xaa);
     if(f->model==6)fw_baseline_expected(b,first);
     b->pattern=1;success(fte3600_device_arm(s),s);success(fte3600_device_irq(s),s);
-    r=status(s);if(r.image_sequence!=2 || b->frames!=2 || b->measurements!=measurements)fprintf(stderr,"seq=%llu frames=%u measurements=%u/%u\n",(unsigned long long)r.image_sequence,b->frames,b->measurements,measurements);
-    CHECK(r.image_sequence==2 && b->frames==2 && b->measurements==measurements);
+    /* The cancelled arm and the explicit one take two frames each (DAC centre
+     * and reference); capture's own arm finds the finger left by the cancelled
+     * arm's detect still on the array, keeps the previous reference after its
+     * single centring frame and reports the touch pending; plus two finger frames. */
+    unsigned expected_frames=raw_array(f)?2+1+2+2:2;
+    r=status(s);if(r.image_sequence!=2 || b->frames!=expected_frames || b->measurements!=measurements)fprintf(stderr,"seq=%llu frames=%u/%u measurements=%u/%u\n",(unsigned long long)r.image_sequence,b->frames,expected_frames,b->measurements,measurements);
+    CHECK(r.image_sequence==2 && b->frames==expected_frames && b->measurements==measurements);
     success(fte3600_device_copy_image(s,2,second,sizeof(second)),s);
     CHECK(memcmp(first,second,(size_t)f->width*f->height));
     CHECK(r.width==f->width && r.height==f->height && r.extra_rows==f->extra);

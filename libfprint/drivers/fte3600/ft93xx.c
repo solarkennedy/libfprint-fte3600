@@ -107,6 +107,28 @@ fte3600_ft93xx_configuration (
   return FTE3600_FT93XX_OK;
 }
 
+enum fte3600_ft93xx_status
+fte3600_ft93xx_raw_image_state (uint16_t raw_id, struct fte3600_ft93xx_state *state)
+{
+  if (state == NULL)
+    return FTE3600_FT93XX_INVALID_ARGUMENT;
+  /* Keyed on the silicon id read from 0x1a8b: a 0x1816 remap to 0x9395 only
+   * changes the active window, not the analog array. */
+  if (raw_id != 0x9391 && raw_id != 0x9392)
+    return FTE3600_FT93XX_UNSUPPORTED_DEVICE;
+  /* Raw-array regime measured on a OneMix 4 (FTE6600, 0x9391): with register
+   * 0x1815 at its power-on value the array responds roughly linearly to the
+   * DAC (about 440 counts per step at integration 256) and shows ridge
+   * contrast of about +/-100 counts once a no-finger reference frame is
+   * subtracted on the host. Finger-detect configuration writes 0x1815=0,
+   * which flattens the array and can only be undone by a hardware reset. */
+  *state = (struct fte3600_ft93xx_state){
+    .dac = 184, .gain = 0, .dac_polarity = 3, .integration = 256,
+    .sample_time = 15, .sample_mode = 2, .subtract_baseline = 0, .mode = 0xa0
+  };
+  return FTE3600_FT93XX_OK;
+}
+
 size_t
 fte3600_ft93xx_frame_count (uint8_t count)
 {
@@ -304,8 +326,14 @@ configure (const struct operation *op, const struct profile *p,
       !checked_write (op, state, 0x180b, 0x0104) ||
       !read_word (op, 0x1812, &value))
     return 0;
-  value = (uint16_t) ((value & 0x8000) |
-                      ((unsigned int) state->subtract_baseline << 14) | 0x0100);
+  /* On FT9769-class parts (0x9391/0x9392) enabling on-chip baseline
+   * subtraction in image mode stalls the scan engine once the integration
+   * exceeds 16 units: the ready flag never rises, every register reads zero
+   * and the part watchdog-resets about 1.6 s later. Observed on a OneMix 4
+   * (ACPI FTE6600); finger-detect mode is unaffected. Capture raw frames and
+   * leave baseline handling to the host pipeline. */
+  unsigned int subtract = p->id == 0x9391 || p->id == 0x9392 ? 0u : state->subtract_baseline;
+  value = (uint16_t) ((value & 0x8000) | (subtract << 14) | 0x0100);
   if (!checked_write (op, state, 0x1812, value))
     return 0;
   state->mode = mode;
@@ -1948,5 +1976,22 @@ fte3600_ft93xx_io_from_recovery (
   output->context = (void *) recovery;
   output->spi = recovery_spi;
   output->wait_ms = recovery_wait;
+  return FTE3600_FT93XX_OK;
+}
+
+enum fte3600_ft93xx_status
+fte3600_ft93xx_fdt_pending (const struct fte3600_ft93xx_io *io, int *pending)
+{
+  enum fte3600_ft93xx_status error = FTE3600_FT93XX_TRANSPORT_ERROR;
+  struct operation op = {io, NULL, &error};
+  uint16_t word;
+
+  if (pending == NULL || !valid_io (io))
+    return FTE3600_FT93XX_INVALID_ARGUMENT;
+  /* Status bit 3 is the latched finger-detect event; fdt_measure clears it
+   * with the same bit in 0x1a84. It stays set until the next arm. */
+  if (!read_word (&op, 0x1a82, &word))
+    return error;
+  *pending = (word & 8) != 0;
   return FTE3600_FT93XX_OK;
 }
