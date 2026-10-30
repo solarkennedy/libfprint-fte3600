@@ -316,6 +316,21 @@ describe_closest (const Fte3600AuthTemplate *print, const Fte3600BriskFeatureSet
                           r->translate_x, r->translate_y, r->angle);
 }
 
+/* Strip sensors (40 px wide and narrower) image about 4 mm of finger per
+ * touch, so two honest touches of one finger usually share no skin at all:
+ * on a 40x196 array, real touch pairs produce 1..8 mutual features unless
+ * they land on the same band, and then 25..50. Chaining every new sample to
+ * an already accepted one rejects exactly the touches that would widen the
+ * template, and the finished template then covers one band and fails most
+ * later presentations. For those profiles enrollment instead collects
+ * distinct samples that each pass the extractor's own quality policy; the
+ * matcher's acceptance policy for verification is unchanged. */
+static gboolean
+coverage_enrollment (const Fte3600MatchProfile *profile)
+{
+  return profile && profile->width <= 40;
+}
+
 static gboolean
 consistent (const Fte3600AuthTemplate *print, const Fte3600BriskFeatureSet *sample,
             guint count, gboolean *accepted, ClosestComparison *closest,
@@ -325,7 +340,9 @@ consistent (const Fte3600AuthTemplate *print, const Fte3600BriskFeatureSet *samp
 
   if (closest)
     closest->reference = count;
-  *accepted = count == 0;
+  *accepted = count == 0 || coverage_enrollment (profile);
+  if (*accepted)
+    return TRUE;
   for (guint i = 0; i < count; i++)
     {
       if (cancelled (cancel, cancel_data, error))
