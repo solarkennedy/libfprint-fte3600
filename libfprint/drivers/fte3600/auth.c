@@ -277,28 +277,71 @@ same_features (const Fte3600BriskFeatureSet *a, const Fte3600BriskFeatureSet *b)
   return TRUE;
 }
 
+/* Closest rejected comparison, kept so an enrollment retry can say which
+ * acceptance gate the capture missed. Diagnostic only; never decides. */
+typedef struct
+{
+  guint                   reference;
+  Fte3600BriskStatus      status;
+  Fte3600BriskMatchResult result;
+} ClosestComparison;
+
+static gboolean
+closer (const ClosestComparison *candidate, const ClosestComparison *best, guint count)
+{
+  if (best->reference >= count)
+    return TRUE;
+  if (candidate->result.inliers != best->result.inliers)
+    return candidate->result.inliers > best->result.inliers;
+  return candidate->result.mutual_matches > best->result.mutual_matches;
+}
+
+static gchar *
+describe_closest (const Fte3600AuthTemplate *print, const Fte3600BriskFeatureSet *sample,
+                  const ClosestComparison *closest, guint count)
+{
+  if (closest->reference >= count)
+    return g_strdup_printf ("features %u; no accepted sample compared", sample->n_features);
+  const Fte3600BriskMatchResult *r = &closest->result;
+  return g_strdup_printf ("features %u; closest sample %u (features %u) status %d: mutual %u inliers %u"
+                          " competing %u ratio %.2f median %.2f rms %.2f hamming %.1f spread q %.1f/%.1f"
+                          " r %.1f/%.1f aniso %.3f/%.3f shift %.1f,%.1f angle %.2f",
+                          sample->n_features, closest->reference,
+                          print->samples[closest->reference].n_features, (int) closest->status,
+                          r->mutual_matches, r->inliers, r->competing_inliers, r->inlier_ratio,
+                          r->median_error, r->rms_error, r->mean_hamming,
+                          r->query_min_variance, r->query_max_variance,
+                          r->reference_min_variance, r->reference_max_variance,
+                          r->normalized_query_anisotropy, r->normalized_reference_anisotropy,
+                          r->translate_x, r->translate_y, r->angle);
+}
+
 static gboolean
 consistent (const Fte3600AuthTemplate *print, const Fte3600BriskFeatureSet *sample,
-            guint count, gboolean *accepted, Fte3600AuthCancelFunc cancel,
-            gpointer cancel_data, GError **error)
+            guint count, gboolean *accepted, ClosestComparison *closest,
+            Fte3600AuthCancelFunc cancel, gpointer cancel_data, GError **error)
 {
   const Fte3600MatchProfile *profile = profile_for (&print->identity);
 
+  if (closest)
+    closest->reference = count;
   *accepted = count == 0;
   for (guint i = 0; i < count; i++)
     {
       if (cancelled (cancel, cancel_data, error))
         return FALSE;
-      Fte3600BriskMatchResult result;
-      const Fte3600BriskStatus status =
-        fpi_fte3600_brisk_match_for_profile (profile, sample, &print->samples[i], &result);
+      ClosestComparison candidate = { .reference = i };
+      candidate.status =
+        fpi_fte3600_brisk_match_for_profile (profile, sample, &print->samples[i], &candidate.result);
       if (cancelled (cancel, cancel_data, error))
         return FALSE;
-      if (status == FPI_BRISK_OK && result.authentication_accepted)
+      if (candidate.status == FPI_BRISK_OK && candidate.result.authentication_accepted)
         {
           *accepted = TRUE;
           return TRUE;
         }
+      if (closest && closer (&candidate, closest, count))
+        *closest = candidate;
     }
   return TRUE;
 }
@@ -326,11 +369,18 @@ fte3600_auth_enrollment_add_full (Fte3600AuthEnrollment *enrollment, const guint
         same_features (&sample, &enrollment->print.samples[i]))
       return fail (error, FTE3600_AUTH_DUPLICATE, "Capture repeats an accepted enrollment sample");
   gboolean accepted;
-  if (!consistent (&enrollment->print, &sample, enrollment->count, &accepted, cancel, cancel_data, error) ||
+  ClosestComparison closest;
+  if (!consistent (&enrollment->print, &sample, enrollment->count, &accepted, &closest,
+                   cancel, cancel_data, error) ||
       cancelled (cancel, cancel_data, error))
     return FALSE;
   if (!accepted)
-    return fail (error, FTE3600_AUTH_INCONSISTENT, "Capture does not strictly match an accepted enrollment sample");
+    {
+      g_autofree gchar *detail = describe_closest (&enrollment->print, &sample, &closest, enrollment->count);
+      g_set_error (error, FTE3600_AUTH_ERROR, FTE3600_AUTH_INCONSISTENT,
+                   "Capture does not strictly match an accepted enrollment sample (%s)", detail);
+      return FALSE;
+    }
   enrollment->print.samples[enrollment->count] = sample;
   memcpy (enrollment->digests[enrollment->count], digest, DIGEST_SIZE);
   enrollment->count++;
@@ -638,7 +688,7 @@ fte3600_auth_template_decode_full (GBytes *bytes, Fte3600AuthCancelFunc cancel,
       if (status != FPI_BRISK_OK || !self.authentication_accepted)
         goto invalid_print;
       gboolean accepted;
-      if (!consistent (print, &print->samples[i], i, &accepted, cancel, cancel_data, error))
+      if (!consistent (print, &print->samples[i], i, &accepted, NULL, cancel, cancel_data, error))
         goto cancelled_print;
       if (!accepted)
         goto invalid_print;
