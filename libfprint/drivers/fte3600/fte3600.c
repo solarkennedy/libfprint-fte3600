@@ -11,6 +11,9 @@
 /* How long a finger may rest on the sensor after its frame was captured before
  * the user is asked to lift it. Users get no other cue that a touch is done. */
 #define RELEASE_PROMPT_MS 2500
+/* Consecutive verify/identify touches that overlapped no enrolled skin before
+ * the driver stops asking for another spot and reports a plain non-match. */
+#define OVERLAP_RETRIES 3
 /* Least share of the strip's rows a raw-array touch must cover before it is
  * matched. Full touches leave only a few edge rows clear (95%+); the partial
  * touches that never match cover 50-75%. */
@@ -25,6 +28,7 @@ struct _FpiDeviceFte3600
   GCancellable                 *worker_cancel;
   gboolean                      worker_active;
   gboolean                      needs_release;
+  guint                         overlap_retries; /* Uninformative touches since the last decisive result. */
   GHashTable                   *template_cache; /* Worker-owned; immutable values, exact byte keys. */
   GQueue                        cache_order;
 };
@@ -234,6 +238,7 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
         error = runtime_error (&diag);
       self->runtime = NULL;
       self->needs_release = FALSE;
+      self->overlap_retries = 0;
       goto out;
     }
   if (g_cancellable_set_error_if_cancelled (cancel, &error))
@@ -256,7 +261,10 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
         error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                           "Sensor profile changed during recovery; reopen the device");
       if (!error)
-        self->identity = opened_identity;
+        {
+          self->identity = opened_identity;
+          self->overlap_retries = 0;
+        }
       if (error && self->runtime)
         {
           fte3600_linux_runtime_close (self->runtime, &diag);
@@ -375,11 +383,26 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
     fte3600_auth_identify_full (probe, templates, &work->best, &match,
                                 auth_cancelled, cancel, &error);
   work->matched = match.matched;
-  fp_dbg ("Frame %" G_GUINT64_FORMAT " %s: inliers %u hamming %.1f rms %.2f",
+  fp_dbg ("Frame %" G_GUINT64_FORMAT " %s: mutual %u inliers %u hamming %.1f rms %.2f%s",
           (guint64) work->frame.status.image_sequence, match.matched ? "matched" : "no match",
-          match.inliers, match.mean_hamming, match.rms_error);
+          match.mutual_matches, match.inliers, match.mean_hamming, match.rms_error,
+          match.uninformative ? " (no overlap with enrolled skin)" : "");
   if (!error && !work->matched)
     work->encoded = fte3600_auth_probe_encode (probe);
+  /* A strip touch that overlapped none of the enrolled skin says nothing
+   * about the finger. The retry channel is the only path that reaches the
+   * user mid-verification, so ask for another spot instead of failing;
+   * the cap keeps an unknown finger from retrying forever. */
+  if (!error && !work->matched && match.uninformative && self->overlap_retries < OVERLAP_RETRIES)
+    {
+      self->overlap_retries++;
+      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                        "Touch did not overlap the enrolled area; try a slightly different spot");
+    }
+  else if (!error)
+    {
+      self->overlap_retries = 0;
+    }
 
 out:
   error = auth_error (g_steal_pointer (&error));

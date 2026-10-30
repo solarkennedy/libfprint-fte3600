@@ -450,22 +450,31 @@ fte3600_auth_match_full (const Fte3600AuthProbe *probe, const Fte3600AuthTemplat
     return fail (error, FTE3600_AUTH_PROFILE_MISMATCH, "Query and template capture identities differ");
   const Fte3600MatchProfile *profile = profile_for (&probe->identity);
   Fte3600AuthMatch best = {0};
+  guint mutual = 0;
   for (guint i = 0; i < FTE3600_AUTH_ENROLL_SAMPLES; i++)
     {
       if (cancelled (cancel, cancel_data, error))
         return FALSE;
-      Fte3600BriskMatchResult evidence;
+      Fte3600BriskMatchResult evidence = {0};
       const Fte3600BriskStatus status =
         fpi_fte3600_brisk_match_for_profile (profile, &probe->features, &print->samples[i], &evidence);
       if (cancelled (cancel, cancel_data, error))
         return FALSE;
+      /* The matcher reports correspondences before it rejects for consensus. */
+      if (evidence.mutual_matches > mutual)
+        mutual = evidence.mutual_matches;
       if (status != FPI_BRISK_OK)
         continue;
-      Fte3600AuthMatch candidate = { evidence.authentication_accepted, evidence.inliers,
-                                     evidence.mean_hamming, evidence.rms_error };
+      Fte3600AuthMatch candidate = { .matched = evidence.authentication_accepted,
+                                     .inliers = evidence.inliers,
+                                     .mean_hamming = evidence.mean_hamming,
+                                     .rms_error = evidence.rms_error };
       if (better (&candidate, &best))
         best = candidate;
     }
+  best.mutual_matches = mutual;
+  best.uninformative = !best.matched && coverage_enrollment (profile) &&
+                       mutual < FTE3600_AUTH_OVERLAP_MUTUAL;
   *result = best;
   return TRUE;
 }
@@ -492,6 +501,8 @@ fte3600_auth_identify_full (const Fte3600AuthProbe *probe, const GPtrArray *prin
     }
   Fte3600AuthMatch best = {0};
   gint index = -1;
+  guint compared = 0, mutual = 0;
+  gboolean uninformative = TRUE;
   for (guint i = 0; i < prints->len; i++)
     {
       if (cancelled (cancel, cancel_data, error))
@@ -502,6 +513,11 @@ fte3600_auth_identify_full (const Fte3600AuthProbe *probe, const GPtrArray *prin
       Fte3600AuthMatch candidate;
       if (!fte3600_auth_match_full (probe, print, &candidate, cancel, cancel_data, error))
         return FALSE;
+      compared++;
+      if (candidate.mutual_matches > mutual)
+        mutual = candidate.mutual_matches;
+      if (!candidate.uninformative)
+        uninformative = FALSE;
       if (better (&candidate, &best))
         {
           best = candidate;
@@ -510,6 +526,9 @@ fte3600_auth_identify_full (const Fte3600AuthProbe *probe, const GPtrArray *prin
     }
   if (cancelled (cancel, cancel_data, error))
     return FALSE;
+  /* The touch is uninformative only when it overlapped none of the gallery. */
+  best.mutual_matches = mutual;
+  best.uninformative = !best.matched && compared > 0 && uninformative;
   *result = best;
   *best_index = index;
   return TRUE;

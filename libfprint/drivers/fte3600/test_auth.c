@@ -117,8 +117,11 @@ test_profile (gconstpointer data)
   g_assert_no_error (error);
   g_assert_true (result.matched);
   g_assert_cmpuint (result.inliers, >=, 5);
-  g_test_message ("chip=%04x geometry=%ux%u bytes=%zu heldout_inliers=%u",
-                  test->chip, test->width, test->height, g_bytes_get_size (wire), result.inliers);
+  g_assert_cmpuint (result.mutual_matches, >=, result.inliers);
+  g_assert_false (result.uninformative);
+  g_test_message ("chip=%04x geometry=%ux%u bytes=%zu heldout_inliers=%u mutual=%u",
+                  test->chip, test->width, test->height, g_bytes_get_size (wire), result.inliers,
+                  result.mutual_matches);
 
   fte3600_auth_test_image (image, identity.width, identity.height, FTE3600_AUTH_TEST_OTHER_SEED, 0);
   g_autoptr(Fte3600AuthProbe) other = fte3600_auth_probe_new (&identity, image, size, identity.width, &error);
@@ -126,6 +129,12 @@ test_profile (gconstpointer data)
   g_assert_true (fte3600_auth_match (other, loaded, &result, &error));
   g_assert_no_error (error);
   g_assert_false (result.matched);
+  /* Only strip profiles may call a non-match uninformative, and only when the
+   * touch overlapped no enrolled sample. */
+  g_assert_cmpint (result.uninformative, ==,
+                   test->width <= 40 && result.mutual_matches < FTE3600_AUTH_OVERLAP_MUTUAL);
+  g_test_message ("chip=%04x other_finger mutual=%u uninformative=%d",
+                  test->chip, result.mutual_matches, result.uninformative);
   memset (image, 128, size);
   g_assert_null (fte3600_auth_probe_new (&identity, image, size, identity.width, &error));
   g_assert_error (error, FTE3600_AUTH_ERROR, FTE3600_AUTH_LOW_QUALITY);
