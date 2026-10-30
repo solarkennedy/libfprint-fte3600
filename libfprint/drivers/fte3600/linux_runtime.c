@@ -399,6 +399,22 @@ remaining (struct fte3600_linux_runtime *r)
   return us <= 0 ? 0 : (uint32_t) ((us + 999) / 1000);
 }
 /* Bounded drain excludes already pending notifications before a new arm. */
+/* Opt-in stderr trace (FTE3600_DEBUG=1) of the session's decisions, for
+ * bring-up on real hardware where fprintd's journal is the only output. */
+static void
+trace (struct fte3600_linux_runtime *r, const char *what, int e)
+{
+  static int enabled = -1;
+  struct fte3600_device_status st;
+
+  if (enabled < 0)
+    enabled = getenv ("FTE3600_DEBUG") != NULL;
+  if (!enabled || fte3600_device_get_status (r->session, &st))
+    return;
+  fprintf (stderr, "fte3600: %s e=%d state=%d seq=%llu dac=%u level=%d shift=%d\n",
+           what, e, (int) st.state, (unsigned long long) st.image_sequence,
+           st.calibrated_image_dac, st.raw_level, st.raw_shift);
+}
 static int
 drain (struct fte3600_linux_runtime *r)
 {
@@ -422,6 +438,7 @@ settle_ft9769 (struct fte3600_linux_runtime *r, int *pending, struct fte3600_lin
   if(drain (r) < 0)
     return wait_error (r, errno, d);
   enum fte3600_device_error e = fte3600_device_pending (r->session, pending);
+  trace (r, *pending ? "touch during arm" : "armed", e);
   return e ? session_error (r, e, d) : FTE3600_RUNTIME_OK;
 }
 static int
@@ -464,6 +481,7 @@ wait_fw_release (struct fte3600_linux_runtime            *r,
         }
       int released = 0;
       enum fte3600_device_error e = fte3600_device_release_step (r->session, &released);
+      trace (r, released ? "released" : "held", e);
       if (e == FTE3600_DEVICE_RECOVERY_REQUIRED && r->recoveries < 3)
         {
           ++r->recoveries;
@@ -527,6 +545,7 @@ fte3600_linux_runtime_capture (struct fte3600_linux_runtime *r,
       goto done;
     }
   e = fte3600_device_arm (r->session);
+  trace (r, "arm", e);
   if(e)
     {
       rc = session_error (r, e, d);
@@ -601,6 +620,7 @@ fte3600_linux_runtime_capture (struct fte3600_linux_runtime *r,
             continue;
         }
       e = fte3600_device_irq (r->session);
+      trace (r, "irq", e);
       if(e == FTE3600_DEVICE_NO_FRAME)
         {
           if(next.status.model == FTE3600_MODEL_FT9769 && (rc = settle_ft9769 (r, &pending, d)) != FTE3600_RUNTIME_OK)

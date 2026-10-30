@@ -181,6 +181,29 @@ runtime_error (const struct fte3600_linux_runtime_diagnostic *diag)
                                    diag->last_configured_mode, diag->acpi_mode, diag->cs_control, diag->cs_retry_attempted);
 }
 
+/* Debug aid: with FTE3600_DUMP_DIR set, every accepted capture is written as
+ * an 8-bit PGM so matcher behaviour can be studied offline. Never on by default. */
+static void
+dump_frame (const struct fte3600_linux_runtime_frame *frame)
+{
+  const gchar *dir = g_getenv ("FTE3600_DUMP_DIR");
+  if (!dir || !*dir || !frame->pixels || !frame->stride || !frame->status.width)
+    return;
+  g_autoptr(GError) error = NULL;
+  const guint width = frame->status.width, rows = frame->length / frame->stride;
+  g_autoptr(GByteArray) pgm = g_byte_array_new ();
+  g_autofree gchar *header = g_strdup_printf ("P5\n%u %u\n255\n", width, rows);
+  g_byte_array_append (pgm, (const guint8 *) header, strlen (header));
+  for (guint y = 0; y < rows; y++)
+    g_byte_array_append (pgm, frame->pixels + y * frame->stride, MIN (width, frame->stride));
+  g_autofree gchar *path = g_strdup_printf ("%s/frame-%" G_GINT64_FORMAT "-%03" G_GUINT64_FORMAT ".pgm", dir,
+                                            g_get_real_time () / G_USEC_PER_SEC,
+                                            (guint64) frame->status.image_sequence);
+  if (g_mkdir_with_parents (dir, 0700) != 0 ||
+      !g_file_set_contents (path, (const gchar *) pgm->data, pgm->len, &error))
+    fp_dbg ("Frame dump to %s failed: %s", path, error ? error->message : g_strerror (errno));
+}
+
 static void
 worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
 {
@@ -269,6 +292,11 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
       goto out;
     }
   self->needs_release = TRUE;
+  fp_dbg ("Captured frame %" G_GUINT64_FORMAT ": model %u chip %04x %ux%u (+%u rows) image DAC %u",
+          (guint64) work->frame.status.image_sequence, work->frame.status.model,
+          work->frame.status.chip_id, work->frame.status.width, work->frame.status.height,
+          work->frame.status.extra_rows, work->frame.status.calibrated_image_dac);
+  dump_frame (&work->frame);
   Fte3600AuthIdentity frame_identity;
   if (!fte3600_auth_identity_from_status (&work->frame.status, &frame_identity, &error) ||
       !fte3600_auth_identity_equal (&self->identity, &frame_identity))
@@ -285,7 +313,6 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
     observe_finger (task, FP_FINGER_STATUS_PRESENT);
   if (work->action == FPI_DEVICE_ACTION_CAPTURE)
     goto out;
-
   if (work->action == FPI_DEVICE_ACTION_ENROLL)
     {
       if (!self->enrollment)
@@ -318,6 +345,9 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
     fte3600_auth_identify_full (probe, templates, &work->best, &match,
                                 auth_cancelled, cancel, &error);
   work->matched = match.matched;
+  fp_dbg ("Frame %" G_GUINT64_FORMAT " %s: inliers %u hamming %.1f rms %.2f",
+          (guint64) work->frame.status.image_sequence, match.matched ? "matched" : "no match",
+          match.inliers, match.mean_hamming, match.rms_error);
   if (!error && !work->matched)
     work->encoded = fte3600_auth_probe_encode (probe);
 
@@ -343,6 +373,8 @@ out:
     }
   if (error && error->domain == FP_DEVICE_RETRY)
     {
+      fp_dbg ("Retry %d after frame %" G_GUINT64_FORMAT ": %s", error->code,
+              (guint64) work->frame.status.image_sequence, error->message);
       work->retry = g_steal_pointer (&error);
       g_task_return_boolean (task, TRUE);
     }
