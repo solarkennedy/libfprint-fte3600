@@ -8,6 +8,10 @@
 #include <errno.h>
 #include <string.h>
 
+/* How long a finger may rest on the sensor after its frame was captured before
+ * the user is asked to lift it. Users get no other cue that a touch is done. */
+#define RELEASE_PROMPT_MS 2500
+
 struct _FpiDeviceFte3600
 {
   FpDevice                      parent;
@@ -274,7 +278,16 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
   if (self->needs_release)
     {
       enum fte3600_linux_runtime_error release =
-        fte3600_linux_runtime_wait_release (self->runtime, cancel, 30000, &diag);
+        fte3600_linux_runtime_wait_release (self->runtime, cancel, RELEASE_PROMPT_MS, &diag);
+      if (release == FTE3600_RUNTIME_TIMEOUT)
+        {
+          /* The finger is still on the sensor long after its frame was taken.
+           * Say so through the retry channel, which every front end displays,
+           * instead of waiting silently; the next attempt waits again. */
+          error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_REMOVE_FINGER,
+                                            "Lift your finger from the sensor");
+          goto out;
+        }
       if (release && release != FTE3600_RUNTIME_RELEASE_UNSUPPORTED)
         {
           error = runtime_error (&diag);
@@ -555,7 +568,8 @@ start_work (FpDevice *device)
   self->worker_active = TRUE;
   if (work->action != FPI_DEVICE_ACTION_OPEN && work->action != FPI_DEVICE_ACTION_CLOSE)
     fpi_device_report_finger_status (device, self->needs_release &&
-                                     self->identity.backend_model == 0x9368 ?
+                                     (self->identity.backend_model == 0x9368 ||
+                                      self->identity.backend_model == 0x9769) ?
                                      FP_FINGER_STATUS_PRESENT : FP_FINGER_STATUS_NEEDED);
   task = g_task_new (device, self->worker_cancel, complete, NULL);
   /* Never publish cancellation while a worker still owns hardware. */
