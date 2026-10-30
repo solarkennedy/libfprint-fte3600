@@ -411,9 +411,9 @@ trace (struct fte3600_linux_runtime *r, const char *what, int e)
     enabled = getenv ("FTE3600_DEBUG") != NULL;
   if (!enabled || fte3600_device_get_status (r->session, &st))
     return;
-  fprintf (stderr, "fte3600: %s e=%d state=%d seq=%llu dac=%u level=%d shift=%d\n",
+  fprintf (stderr, "fte3600: %s e=%d state=%d seq=%llu dac=%u level=%d shift=%d contact=%d\n",
            what, e, (int) st.state, (unsigned long long) st.image_sequence,
-           st.calibrated_image_dac, st.raw_level, st.raw_shift);
+           st.calibrated_image_dac, st.raw_level, st.raw_shift, st.raw_contact);
 }
 static int
 drain (struct fte3600_linux_runtime *r)

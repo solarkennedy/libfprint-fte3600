@@ -11,6 +11,10 @@
 /* How long a finger may rest on the sensor after its frame was captured before
  * the user is asked to lift it. Users get no other cue that a touch is done. */
 #define RELEASE_PROMPT_MS 2500
+/* Least share of the strip's rows a raw-array touch must cover before it is
+ * matched. Full touches leave only a few edge rows clear (95%+); the partial
+ * touches that never match cover 50-75%. */
+#define CONTACT_MIN_PERCENT 80
 
 struct _FpiDeviceFte3600
 {
@@ -305,10 +309,11 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
       goto out;
     }
   self->needs_release = TRUE;
-  fp_dbg ("Captured frame %" G_GUINT64_FORMAT ": model %u chip %04x %ux%u (+%u rows) image DAC %u",
+  fp_dbg ("Captured frame %" G_GUINT64_FORMAT ": model %u chip %04x %ux%u (+%u rows) image DAC %u contact %d%%",
           (guint64) work->frame.status.image_sequence, work->frame.status.model,
           work->frame.status.chip_id, work->frame.status.width, work->frame.status.height,
-          work->frame.status.extra_rows, work->frame.status.calibrated_image_dac);
+          work->frame.status.extra_rows, work->frame.status.calibrated_image_dac,
+          work->frame.status.raw_contact);
   dump_frame (&work->frame);
   Fte3600AuthIdentity frame_identity;
   if (!fte3600_auth_identity_from_status (&work->frame.status, &frame_identity, &error) ||
@@ -326,6 +331,18 @@ worker (GTask *task, gpointer source, gpointer task_data, GCancellable *cancel)
     observe_finger (task, FP_FINGER_STATUS_PRESENT);
   if (work->action == FPI_DEVICE_ACTION_CAPTURE)
     goto out;
+  /* A strip touch that leaves part of the array uncovered has too little skin
+   * to match and is the one placement fault the user can correct on the next
+   * touch, so say so before the matcher turns it into a silent rejection. */
+  if (work->frame.status.model == FTE3600_MODEL_FT9769 &&
+      work->frame.status.raw_contact < CONTACT_MIN_PERCENT)
+    {
+      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                        "Finger covers %d%% of the sensor; press flat over the whole button",
+                                        work->frame.status.raw_contact);
+      goto out;
+    }
+
   if (work->action == FPI_DEVICE_ACTION_ENROLL)
     {
       if (!self->enrollment)

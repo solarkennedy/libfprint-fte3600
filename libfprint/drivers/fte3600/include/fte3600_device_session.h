@@ -92,6 +92,10 @@ struct fte3600_device_status
   /* Raw-array flow (FT9769): median of the last scan, and its shift against
    * the no-finger reference for the last touch or release decision. */
   int      raw_level, raw_shift;
+  /* Percentage of image rows whose mean sat at least RAW_TOUCH_SHIFT below
+   * the reference in the last accepted raw frame: how much of the strip the
+   * finger actually covered. */
+  int      raw_contact;
 };
 struct fte3600_device_session;
 /* create copies configuration/callback tables, owns all mutable family state

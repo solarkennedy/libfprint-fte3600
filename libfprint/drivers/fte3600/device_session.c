@@ -755,6 +755,22 @@ raw_acquire (struct fte3600_device_session *s)
         }
     }
   size_t n = s->image_bytes;
+  /* Row-wise contact before normalisation: the strip is only 2 mm wide, so a
+   * finger that misses part of its length leaves rows at the reference level.
+   * The glue turns a short count into a placement prompt instead of matching. */
+  {
+    const size_t width = s->status.width, rows = width ? n / width : 0;
+    size_t touched = 0;
+    for (size_t r = 0; r < rows; ++r)
+      {
+        long sum = 0;
+        for (size_t c = 0; c < width; ++c)
+          sum += (long) s->processed[r * width + c] - (long) s->reference[r * width + c];
+        if (sum <= -(long) RAW_TOUCH_SHIFT * (long) width)
+          ++touched;
+      }
+    s->status.raw_contact = rows ? (int) (touched * 100 / rows) : 0;
+  }
   for (size_t i = 0; i < n; ++i)
     {
       int v = 2048 + (int) s->processed[i] - (int) s->reference[i];
